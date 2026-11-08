@@ -148,6 +148,14 @@ function turnToHistoryContent(turn: MixTurn, isLast: boolean, feedOf?: MixFeedRe
  * 玩家发言）。默认不裁——玩家在对局设置里调了才生效；只裁发给模型的消息，
  * 存储与界面回放永远完整。
  */
+/**
+ * 对局进行了几轮：玩家发一句、模型回一句算一轮，按玩家发言数算。
+ * 开场白不算轮；玩家刚发完还没等到回复的那一轮也算在内。列表页与删除确认用它计数。
+ */
+export function mixRoundCount(turns: MixTurn[]): number {
+    return turns.reduce((n, t) => (t.role === "user" ? n + 1 : n), 0);
+}
+
 export function limitMixTurns(turns: MixTurn[], limit: number | undefined): MixTurn[] {
     if (!limit || limit <= 0) return turns;
     let count = 0;
@@ -164,6 +172,7 @@ function buildMixMessages(
     assembled: MixAssembledPrompt,
     extraUserNudge?: string,
     feedOf?: MixFeedResolver,
+    lastReplyOverride?: string,
 ): LLMMessage[] {
     const messages: LLMMessage[] = [
         { role: "system", content: assembled.system, _debugMeta: { marker: "mixology_system" } },
@@ -174,9 +183,13 @@ function buildMixMessages(
         if (turns[i].role === "assistant") { lastAssistantIdx = i; break; }
     }
     for (const [i, turn] of turns.entries()) {
+        const isLast = i === lastAssistantIdx;
         messages.push({
             role: turn.role,
-            content: turnToHistoryContent(turn, i === lastAssistantIdx, feedOf),
+            // 机括落杯前改写过最近一条 assistant：发给模型的整条换成它给的（只改请求，不落库）
+            content: isLast && typeof lastReplyOverride === "string"
+                ? lastReplyOverride
+                : turnToHistoryContent(turn, isLast, feedOf),
             _debugMeta: { marker: "mixology_history", _fromHistory: true },
         });
     }
@@ -303,9 +316,9 @@ export type MixReplyResult = {
 async function runMechanismHooks(
     session: MixSession,
     hook: MixHook,
-    input: { text?: string; ticketRaws?: string[]; encoreRaws?: string[]; edited?: boolean },
+    input: { text?: string; raw?: string; ticketRaws?: string[]; encoreRaws?: string[]; edited?: boolean; lastReply?: string },
     roster?: MixMechanismMaterial[],
-): Promise<{ text?: string; notes: string[]; sections: MixHookSection[]; state: MixState; store: Record<string, Record<string, string>>; roster: MixMechanismMaterial[]; wrote: string[] }> {
+): Promise<{ text?: string; raw?: string; lastReply?: string; notes: string[]; sections: MixHookSection[]; state: MixState; store: Record<string, Record<string, string>>; roster: MixMechanismMaterial[]; wrote: string[] }> {
     // roster：这一轮的机括名单。生效条件一轮只判一次（落杯前那次），之后
     // 由调用方原封传回来——否则小票一更新记住的值，条件在同一轮里翻脸，
     // 落杯前注入的标记行就没人回收，原样漏进正文。
@@ -317,7 +330,7 @@ async function runMechanismHooks(
     }
     const store = { ...(session.mechanismStore ?? {}) };
     // wrote：这一趟真正重新记了账的机括。调用方据此判断"谁没记"，别让它原来的账被连累
-    const out = { text: input.text, notes: [] as string[], sections: [] as MixHookSection[], state: {} as MixState, store, roster: mechanisms, wrote: [] as string[] };
+    const out = { text: input.text, raw: input.raw, lastReply: input.lastReply, notes: [] as string[], sections: [] as MixHookSection[], state: {} as MixState, store, roster: mechanisms, wrote: [] as string[] };
     if (!mechanisms.length) return out;
     for (const material of mechanisms) {
         const script = material.script?.trim();
@@ -331,6 +344,10 @@ async function runMechanismHooks(
             charName: session.charName,
             userName: session.userName || MIX_DEFAULT_USER_NAME,
             text: out.text,
+            // 模型原文（剥块前）：前一件机括剪过的版本接着给下一件
+            raw: out.raw,
+            // 最近一条 assistant（落杯前）：前一件机括改过的版本接着给下一件
+            lastReply: out.lastReply,
             // 单块字段留给老机括脚本（多块时给第一块），全量走 ticketRaws/encoreRaws
             ticketRaw: input.ticketRaws?.[0],
             encoreRaw: input.encoreRaws?.[0],
@@ -343,6 +360,8 @@ async function runMechanismHooks(
             ? await runMixTrustedHook(session.id, material.id, hook, payload)
             : await runMixHook(session.id, material.id, script, hook, payload);
         if (typeof result.text === "string") out.text = result.text;
+        if (typeof result.raw === "string") out.raw = result.raw;
+        if (typeof result.lastReply === "string") out.lastReply = result.lastReply;
         if (result.note) out.notes.push(result.note);
         if (result.sections?.length) out.sections.push(...result.sections);
         if (result.state) out.state = mergeHookState(out.state, result.state);
@@ -351,15 +370,23 @@ async function runMechanismHooks(
     return out;
 }
 
-/** 落杯前：给机括一次改写玩家发言、追加临时提示的机会。返回本轮机括名单，出杯后照单回收 */
-async function runBeforeSendHooks(session: MixSession, text?: string): Promise<{ session: MixSession; text?: string; note?: string; sections: MixHookSection[]; roster: MixMechanismMaterial[] }> {
-    const result = await runMechanismHooks(session, "beforeSend", { text });
+/**
+ * 落杯前：给机括一次改写玩家发言、追加临时提示、改写最近一条 assistant 消息的机会。
+ * 返回本轮机括名单，出杯后照单回收。lastReply 只在有机括真改了时才返回（没改就按原样拼历史）。
+ */
+async function runBeforeSendHooks(session: MixSession, text?: string): Promise<{ session: MixSession; text?: string; note?: string; sections: MixHookSection[]; roster: MixMechanismMaterial[]; lastReply?: string }> {
+    // 最近一条 assistant 将要发给模型的样子：与 buildMixMessages 同一口径（回传裁决也一样）
+    const lastAssistant = [...session.turns].reverse().find((t) => t.role === "assistant");
+    const feedOf = buildFeedResolver(session, sessionTickets(session).filter((t) => t.contract.trim()), sessionEncores(session).filter((e) => e.contract?.trim()));
+    const lastReply = lastAssistant ? turnToHistoryContent(lastAssistant, true, feedOf) : undefined;
+    const result = await runMechanismHooks(session, "beforeSend", { text, lastReply });
     const next: MixSession = {
         ...session,
         state: mergeHookState(session.state ?? {}, result.state),
         mechanismStore: result.store,
     };
-    return { session: next, text: result.text, note: result.notes.join("\n") || undefined, sections: result.sections, roster: result.roster };
+    const rewritten = lastAssistant && typeof result.lastReply === "string" && result.lastReply !== lastReply ? result.lastReply : undefined;
+    return { session: next, text: result.text, note: result.notes.join("\n") || undefined, sections: result.sections, roster: result.roster, lastReply: rewritten };
 }
 
 /**
@@ -468,6 +495,7 @@ async function runMixGeneration(
     onDelta?: (text: string) => void,
     roster?: MixMechanismMaterial[],
     sections?: MixHookSection[],
+    lastReply?: string,
 ): Promise<MixReplyResult> {
     const apiConfig = resolveMixApiConfig();
     if (!apiConfig) {
@@ -479,6 +507,8 @@ async function runMixGeneration(
     let extraNote: string | undefined;
     // 机括挂进系统提示词的段：与 note 一样只活这一轮，不落库
     let hookSections = sections;
+    // 机括改写过的最近一条 assistant：同样只活这一轮，不落库
+    let hookLastReply = lastReply;
     // 本轮机括名单：落杯前判一次条件，出杯后照同一份名单跑回收——
     // 中途小票改了记住的值也不换人，注入过格式要求的机括必须自己收尾
     let turnRoster = roster;
@@ -487,12 +517,13 @@ async function runMixGeneration(
         working = before.session;
         extraNote = before.note;
         hookSections = before.sections;
+        hookLastReply = before.lastReply;
         turnRoster = before.roster;
         if (working !== session) saveMixSession(working);
     }
     const combinedNudge = [nudge, extraNote].filter(Boolean).join("\n\n") || undefined;
     const { prompt: assembled, tickets, encores, active } = assembleFromSession(working, hookSections);
-    const messages = buildMixMessages(working, assembled, combinedNudge, buildFeedResolver(working, tickets, encores));
+    const messages = buildMixMessages(working, assembled, combinedNudge, buildFeedResolver(working, tickets, encores), hookLastReply);
     const meta = { characterName: working.charName, userName: working.userName || "你" };
     // skipTimestampStrip：特调是"所见即模型所写"，不走聊天那套幻觉时间戳剥离——
     // 那个剥离器在流式时会扣住尾部 64 字等括号闭合，机括的末尾标记行会整行压在里面不出来
@@ -521,7 +552,14 @@ async function runMixGeneration(
     // 这一格是累加型，条件命中的几张滤网按顺序串联清洗。
     const filterRules = (active.filter ?? [])
         .flatMap((m) => (m.kind === "filter" ? m.rules : []));
-    const stripped = stripMixReply(raw, contractTickets, contractEncores, filterRules);
+    // 记账前底稿：编辑这一轮原文后自动回滚重跑的基准——两道出杯后钩子都还没记账的那份
+    const storeBeforeReply = working.mechanismStore ?? {};
+    // 出杯后第一道（剥块前）：机括拿到原文一个字不少，可以先把自己要模型写的伪装块剪走，
+    // 宿主随后剥块、存库、画卡看到的就是剪过的版本。存的真原文（rawText）仍是模型写的那份，
+    // 编辑/重画时从它出发再跑一遍这道钩子，结果一致。
+    const rawHook = await runMechanismHooks(working, "rawReply", { raw }, turnRoster);
+    working = { ...working, state: mergeHookState(working.state ?? {}, rawHook.state), mechanismStore: rawHook.store };
+    const stripped = stripMixReply(typeof rawHook.raw === "string" ? rawHook.raw : raw, contractTickets, contractEncores, filterRules);
     let ticketBlocks = stripped.ticketBlocks;
     const encoreBlocks = stripped.encoreBlocks;
     const text = stripped.text;
@@ -570,7 +608,7 @@ async function runMixGeneration(
         state: nextState,
         mechanismStore: afterHook.store,
         // 记账前底稿：编辑这一轮原文后自动回滚重跑的基准
-        mechanismStorePrev: working.mechanismStore ?? {},
+        mechanismStorePrev: storeBeforeReply,
         mechanismStorePrevTurn: turn.id,
     };
     saveMixSession(updated);
@@ -606,7 +644,7 @@ export async function generateMixReply(
     onUserTurn?.();
     // 这条路径的落杯前已经跑过了，别在 runMixGeneration 里重复触发；
     // 名单原封带过去，出杯后照单回收
-    return runMixGeneration(withUser, before.note, signal, true, onDelta, before.roster, before.sections);
+    return runMixGeneration(withUser, before.note, signal, true, onDelta, before.roster, before.sections, before.lastReply);
 }
 
 /** 本局全部小票材料（记住的值的声明来源），按槽位顺序 */
@@ -956,19 +994,28 @@ export async function runMixEditSync(sessionId: string, turnId: string): Promise
     for (let i = idx; i <= last; i += 1) {
         const turn = turns[i];
         if (turn.role !== "assistant") continue;
-        // 这一轮的正文已由 editMixTurn 按新原文剥好；后面几轮各自按自己的原文重剥
-        const stripped = i === idx
-            ? { text: turn.text, ticketBlocks: mixTurnTicketBlocks(turn), encoreBlocks: mixTurnEncoreBlocks(turn) }
-            : stripMixReply(
-                turn.rawText ?? turn.text,
+        // 每一轮都从真原文出发重来一遍：先跑剥块前钩子（机括剪走自己的伪装块），再剥块。
+        // 被编辑的这一轮 editMixTurn 保存时已同步剥过一次（那一刻跑不了异步钩子），这里照样重来，
+        // 没留真原文的老轮次才退回用它已剥好的结果。
+        const here = { ...session, turns: turns.slice(0, i), state, mechanismStore: store };
+        const rawHook = turn.rawText !== undefined
+            ? await runMechanismHooks(here, "rawReply", { raw: turn.rawText, edited: true }, roster)
+            : null;
+        if (rawHook) { state = mergeHookState(state, rawHook.state); store = rawHook.store; }
+        const stripped = turn.rawText !== undefined
+            ? stripMixReply(
+                typeof rawHook?.raw === "string" ? rawHook.raw : turn.rawText,
                 poolOf(mixTurnTicketBlocks(turn), tickets),
                 poolOf(mixTurnEncoreBlocks(turn), encores),
                 filterRules,
-            );
+            )
+            : i === idx
+                ? { text: turn.text, ticketBlocks: mixTurnTicketBlocks(turn), encoreBlocks: mixTurnEncoreBlocks(turn) }
+                : stripMixReply(turn.text, poolOf(mixTurnTicketBlocks(turn), tickets), poolOf(mixTurnEncoreBlocks(turn), encores), filterRules);
         const ticketRaws = stripped.ticketBlocks.map((b) => b.raw);
         const encoreRaws = stripped.encoreBlocks.map((b) => b.raw);
         const result = await runMechanismHooks(
-            { ...session, turns: turns.slice(0, i), state, mechanismStore: store },
+            { ...here, state, mechanismStore: store },
             "afterReply",
             {
                 text: stripped.text,
@@ -981,8 +1028,9 @@ export async function runMixEditSync(sessionId: string, turnId: string): Promise
         // 这一趟没重新记账的机括保留它原来的账，不跟着起跑点一起退回去——钩子出错、
         // 超时、或者自己决定这一轮不记，都不该让面板上已有的内容凭空消失。
         const next = { ...result.store };
+        const wrote = [...(rawHook?.wrote ?? []), ...result.wrote];
         for (const [id, bucket] of Object.entries(turn.mechanismStore ?? session.mechanismStore ?? {})) {
-            if (!result.wrote.includes(id)) next[id] = bucket;
+            if (!wrote.includes(id)) next[id] = bucket;
         }
         // 面板手改过的桶：走到它发生的那一轮就再盖一次，手改永远是权威
         Object.assign(next, turn.mechanismStoreEdits ?? {});

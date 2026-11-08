@@ -17,6 +17,7 @@ export type MixMaterialKind =
     | "ticket"    // 小票：状态数据卡（输出契约 + 渲染代码）
     | "garnish"   // 外观：界面美化 CSS
     | "encore"    // 尾调：随卡互动 HTML 小品
+    | "checklist" // 核对：输出格式检查——系统提示词最后一节的收尾清单（叠加；不配则没有这一段，官方出厂件可选）
     | "filter"    // 滤网：正则清洗正文（不进提示词）
     | "mechanism"; // 机括：沙盒里跑的钩子逻辑 + 常驻界面
 
@@ -31,13 +32,14 @@ export const MIX_KIND_LABELS: Record<MixMaterialKind, string> = {
     ticket: "小票",
     garnish: "外观",
     encore: "尾调",
+    checklist: "核对",
     filter: "滤网",
     mechanism: "机括",
 };
 
 /** 吧台槽位顺序（角色卡永远第一槽） */
 export const MIX_SLOT_ORDER: MixMaterialKind[] = [
-    "character", "persona", "preface", "base", "flavor", "glass", "strength", "ticket", "garnish", "encore", "filter", "mechanism",
+    "character", "persona", "preface", "base", "flavor", "glass", "strength", "ticket", "garnish", "encore", "checklist", "filter", "mechanism",
 ];
 
 /** TAB 上大字下面那行小字：说明这一类到底干什么（不进提示词的种类标它的实际职责） */
@@ -52,6 +54,7 @@ export const MIX_KIND_SECTION_LABELS: Record<MixMaterialKind, string> = {
     ticket: "状态栏",
     garnish: "界面样式",
     encore: "小剧场",
+    checklist: "输出格式检查",
     filter: "正则替换",
     mechanism: "可执行逻辑",
 };
@@ -76,6 +79,7 @@ export const MIX_SLOT_STACK: Record<MixMaterialKind, "concat" | "first"> = {
     ticket: "concat",
     garnish: "concat",
     encore: "concat",
+    checklist: "concat",
     filter: "concat",
     mechanism: "concat",
 };
@@ -241,7 +245,7 @@ export const MIX_SECTION_TITLE_DEFAULTS: Record<MixSectionTitleKey, string> = {
 
 /** 纯文本类材料：序言 / 基底 / 风味 / 杯型 / 苦精 */
 export type MixTextMaterial = MixMaterialMeta & {
-    kind: "preface" | "base" | "flavor" | "glass" | "strength";
+    kind: "preface" | "base" | "flavor" | "glass" | "strength" | "checklist";
     content: string;
     /** 仅序言使用：自定义各分段标题（可用 {{char}}/{{user}} 宏），让整份提示词
      *  的措辞跟上序言定下的基调。缺省/留空的键用默认标题；交叉引用（如输出
@@ -547,9 +551,9 @@ export type MixMechanismMaterial = MixMaterialMeta & {
      */
     connectors?: string[];
     /**
-     * 对白按钮：装了这件机括的对局里，宿主在每句「对白」后面画一颗小图标，
-     * 点击把这句话递进常驻界面（window.onMixDialogue）。按钮由宿主画、样式统一，
-     * 界面只管收到之后做什么（比如请连接器合成语音）。需要有 panelHtml 才收得到。
+     * 对白按钮（旧写法，仍然认）：现在由代码自己登记——界面里 window.mix.dialogueButton({ icon, title })，
+     * 信任模式 mix.dialogueButton({ icon, title })。宿主在每句「对白」后面画一颗小图标，点击把这句话递进
+     * 界面（window.onMixDialogue）。编辑器里不再有这个框；老材料上填过的照常生效。
      */
     dialogueButton?: MixDialogueButton;
     /**
@@ -570,10 +574,15 @@ export type MixDialogueButton = {
 /** 对白按钮的状态（界面用 mix.mark 回报）：busy 转圈、playing 高亮、空串恢复 */
 export type MixDialogueState = "busy" | "playing" | "";
 
+/** 对白按钮的内置图标名（画成与特调同色系的线性图标）；不在这里的当 emoji / 单字原样显示 */
+export const MIX_DIALOGUE_ICON_NAMES = ["speaker", "play", "translate", "note", "bookmark", "star", "heart", "quote", "spark"] as const;
+
 export function normalizeMixDialogueButton(value: unknown): MixDialogueButton | undefined {
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const record = value as Record<string, unknown>;
-    const icon = typeof record.icon === "string" ? record.icon.trim().slice(0, 4) : "";
+    const rawIcon = typeof record.icon === "string" ? record.icon.trim() : "";
+    // 内置名字整个留下（"speaker" 截成 "spea" 就画不出图标了）；emoji / 单字最多四个字符
+    const icon = (MIX_DIALOGUE_ICON_NAMES as readonly string[]).includes(rawIcon.toLowerCase()) ? rawIcon.toLowerCase() : rawIcon.slice(0, 4);
     if (!icon) return undefined;
     const title = typeof record.title === "string" ? record.title.trim().slice(0, 24) : "";
     return title ? { icon, title } : { icon };
@@ -812,6 +821,11 @@ export type MixSession = {
      * 需要留住的状态放机括存储桶里）。
      */
     panelOpen?: Record<string, boolean>;
+    /**
+     * 机括在代码里登记过的对白按钮（materialId → 图标/提示）。按钮位面板关着时代码没跑、登记不到，
+     * 记住上一次登记的，重进对局照样先把按钮画出来。
+     */
+    dialogueButtons?: Record<string, MixDialogueButton>;
     /**
      * 退役的渲染皮（materialId → 渲染 HTML）：局中换小票/尾调那一刻，旧件的
      * 渲染代码快照进来，被盖了戳的历史轮（MixTurn.ticketId/encoreId）按这份

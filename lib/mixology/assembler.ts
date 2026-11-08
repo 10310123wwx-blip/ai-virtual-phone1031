@@ -203,29 +203,6 @@ function encoreSection(encores: MixEncoreMaterial[], charName: string, userName:
     return lines.join("\n");
 }
 
-/** 收尾核对清单：放在最后压阵，防止模型写完正文忘了必须输出的块。
- *  段名引用跟随序言的自定义标题（refs），改了标题清单仍指得到对应段。 */
-function checklistSection(
-    ticketCount: number,
-    encoreCount: number,
-    title: string,
-    refs: { glass: string; ticket: string; encore: string },
-): string | null {
-    if (!ticketCount && !encoreCount) return null;
-    const items = [`- 正文符合「${refs.glass}」。`];
-    if (ticketCount === 1) {
-        items.push(`- 回复最开头已按「${refs.ticket}」的格式输出 ${MIX_TICKET_OPEN}...${MIX_TICKET_CLOSE} 块——任何一轮都不能缺。`);
-    } else if (ticketCount > 1) {
-        items.push(`- 回复最开头已按「${refs.ticket}」的格式与顺序输出全部 ${ticketCount} 块（每块开标签带名字）——任何一轮任何一块都不能缺。`);
-    }
-    if (encoreCount === 1) {
-        items.push(`- 回复最末尾已按「${refs.encore}」的格式输出 ${MIX_ENCORE_OPEN}...${MIX_ENCORE_CLOSE} 块——任何一轮都不能缺。`);
-    } else if (encoreCount > 1) {
-        items.push(`- 回复最末尾已按「${refs.encore}」的格式与顺序输出全部 ${encoreCount} 块（每块开标签带名字）——任何一轮任何一块都不能缺。`);
-    }
-    return [`# ${title}`, "每轮回复发出前逐项核对：", ...items].join("\n");
-}
-
 function exampleSection(card: MixCharacterCard, charName: string, userName: string, title: string): string | null {
     const examples = card.examples?.filter((e) => e.text.trim());
     if (!examples?.length) return null;
@@ -271,6 +248,8 @@ export function assembleMixPrompt(input: MixAssembleInput): MixAssembledPrompt {
     const flavorText = stackBody(m.flavor, apply);
     const glassText = stackBody(m.glass, apply);
     const strengthText = stackBody(m.strength, apply);
+    // 核对：输出格式检查，叠多件按顺序拼；与序言同规则——槽里没装就没有这一段（官方出厂件可选）
+    const checklistText = stackBody(m.checklist, apply);
 
     // 机括挂段：某一段本身为空（没装面具、没有文风）时挂在它上面的内容照样出现，
     // 位置就是那一段本来该在的位置。宏照常替换，多件机括按钩子跑的顺序依次接。
@@ -312,12 +291,8 @@ export function assembleMixPrompt(input: MixAssembleInput): MixAssembledPrompt {
         withHung("ticket", ticketSection(tickets, charName, userName, input.state, sectionTitle("ticket"))),
         withHung("encore", encoreSection(encores, charName, userName, input.state, sectionTitle("encore"))),
         withHung("examples", exampleSection(card, charName, userName, sectionTitle("examples"))),
-        withHung("checklist", checklistSection(
-            tickets.filter((t) => t.contract.trim()).length,
-            encores.filter((e) => e.contract?.trim()).length,
-            sectionTitle("checklist"),
-            { glass: sectionTitle("glass"), ticket: sectionTitle("ticket"), encore: sectionTitle("encore") },
-        )),
+        // 输出格式检查：只来自「核对」材料，不做暗兜底
+        withHung("checklist", checklistText ? `# ${sectionTitle("checklist")}\n${checklistText}` : null),
     ];
 
     const openings = card.openings.filter((o) => o.trim());

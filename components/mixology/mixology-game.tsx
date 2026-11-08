@@ -11,7 +11,7 @@ import { findMixConnector, getMixMaterial, getMixSession, isMixBuiltinId, listMi
 import { applyMixMacros, MIX_DEFAULT_USER_NAME } from "@/lib/mixology/assembler";
 import { buildMixConditionContext, pickActiveMixMaterials } from "@/lib/mixology/state";
 import { scopeMixCss } from "@/lib/mixology/css-scope";
-import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixPanelSlotOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterial, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn } from "@/lib/mixology/types";
+import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixPanelSlotOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterial, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn, type MixDialogueButton } from "@/lib/mixology/types";
 import { applyMixFilterRules, mixStreamText } from "@/lib/mixology/prose";
 import { MixProseView } from "./prose-view";
 import { MixRichText } from "./rich-text";
@@ -39,6 +39,16 @@ type GameProps = {
 
 /** 一轮里要渲染的一块（状态栏/小剧场）：皮 + 这一轮的原文 */
 type TurnFrame = { key: string; html: string; raw: string };
+
+/**
+ * 旧轮次懒加载：进对局只渲染最近这么多条（一条 = 一句用户发言或一轮 AI 回复），
+ * 更早的收起来，顶上一颗「查看更早」按钮按批展开。
+ * 每轮 AI 回复的状态栏/小剧场都是带脚本的沙盒 iframe，几十轮全挂着是手机上内存超限闪退的主因。
+ */
+const MIX_INITIAL_TURNS = 12;
+const MIX_LOAD_MORE_TURNS = 12;
+/** 回溯把轮次砍短后至少还露着几条（不足就把收起数往回让） */
+const MIX_MIN_VISIBLE_TURNS = 4;
 
 function AssistantTurn({ turn, ticketFrames, encoreFrames, filterRules, state, dialogue }: { turn: MixTurn; ticketFrames: TurnFrame[]; encoreFrames: TurnFrame[]; filterRules?: MixFilterRule[]; state?: MixState; dialogue?: MixProseDialogue }) {
     // 展示顺序：状态栏在正文前、小剧场在正文后（与模型的输出顺序一致，无需重排）；
@@ -197,6 +207,18 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
      * free = 用户自己翻过了，别再拽他。
      */
     const stickRef = useRef<"top" | "bottom" | "free">("bottom");
+    /**
+     * 懒加载：收起的更早轮次数（从头数）。记"收起几条"而不是"露出几条"：
+     * 回溯把后面的轮次砍掉时，收起的那些不会因此从顶上冒出来把画面往下推——
+     * 用户正停在被回溯的那一轮上，iOS 没有 scroll anchoring，顶上一长就跳走了。
+     */
+    const [hiddenTurnCount, setHiddenTurnCount] = useState(0);
+    /**
+     * 展开更早的轮次后，把原来最上面那条钉在屏幕上原来的位置：新插进来的轮次里
+     * 小票/小剧场 iframe 是异步报高的，头一两秒内容会连着长高几次，每次报高都按锚点重落一次，
+     * iOS Safari 没有 scroll anchoring，不这么做就会被推得乱跳。
+     */
+    const loadMoreAnchorRef = useRef<{ turnId: string; top: number; until: number } | null>(null);
 
     const handleWheelScroll = useCallback(() => {
         const el = wheelRef.current;
@@ -354,11 +376,26 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
      * 点击把这句话递进它的界面（sendMixDialogue），界面用 mix.mark 回报状态改图标。
      * 按钮位（header/inputbar-*）的面板关着时收不到，先替玩家打开再递。
      */
+    // 代码里登记的对白按钮（mix.dialogueButton）：materialId → 图标/提示。进局先拿上一次记住的，
+    // 代码跑起来重新登记后覆盖；按钮位面板关着代码没跑时，靠记住的那份先把按钮画出来
+    const [runtimeButtons, setRuntimeButtons] = useState<Record<string, MixDialogueButton>>(() => ({ ...(getMixSession(sessionId)?.dialogueButtons ?? {}) }));
+    const handleDialogueButton = useCallback((materialId: string, button: MixDialogueButton | null) => {
+        setRuntimeButtons((prev) => {
+            const same = button ? prev[materialId]?.icon === button.icon && (prev[materialId]?.title ?? "") === (button.title ?? "") : !prev[materialId];
+            if (same) return prev;
+            const next = { ...prev };
+            if (button) next[materialId] = button; else delete next[materialId];
+            const current = getMixSession(sessionId);
+            if (current) saveMixSession({ ...current, dialogueButtons: Object.keys(next).length ? next : undefined });
+            return next;
+        });
+    }, [sessionId]);
     const dialogueActions = useMemo(
         () => activeMechanisms
-            .filter((material) => material.dialogueButton?.icon && (material.trusted ? material.script?.trim() : material.panelHtml?.trim()))
-            .map((material) => ({ key: material.id, icon: material.dialogueButton!.icon, title: material.dialogueButton!.title || material.name })),
-        [activeMechanisms],
+            .map((material) => ({ material, button: runtimeButtons[material.id] ?? material.dialogueButton }))
+            .filter(({ material, button }) => button?.icon && (material.trusted ? material.script?.trim() : material.panelHtml?.trim()))
+            .map(({ material, button }) => ({ key: material.id, icon: button!.icon, title: button!.title || material.name })),
+        [activeMechanisms, runtimeButtons],
     );
     const [dialogueStates, setDialogueStates] = useState<Record<string, string>>({});
     const handlePanelMark = useCallback((materialId: string, id: string, state: string) => {
@@ -478,7 +515,9 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const [entering, setEntering] = useState(true);
     useLayoutEffect(() => {
         setEntering(true);
+        loadMoreAnchorRef.current = null;
         const entered = getMixSession(sessionId);
+        setHiddenTurnCount(Math.max(0, (entered?.turns.length ?? 0) - MIX_INITIAL_TURNS));
         stickRef.current = (entered?.turns ?? []).some((turn) => turn.role === "user") ? "bottom" : "top";
         applyStick();
         const timer = window.setTimeout(() => {
@@ -504,16 +543,60 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
      * 之后同步调的，那一刻新高度还没提交进 DOM，落点会按旧的 scrollHeight 算，等于白落。
      * 隔两帧再落，确保 React 提交完、浏览器也重新布局过。
      */
+    const restoreLoadMoreAnchor = useCallback((): boolean => {
+        const anchor = loadMoreAnchorRef.current;
+        const el = scrollRef.current;
+        if (!anchor || !el) return false;
+        if (Date.now() > anchor.until) { loadMoreAnchorRef.current = null; return false; }
+        const target = el.querySelector<HTMLElement>(`[data-turn-id="${anchor.turnId}"]`);
+        if (!target) return false;
+        const now = target.getBoundingClientRect().top - el.getBoundingClientRect().top;
+        el.scrollTop += now - anchor.top;
+        lastTopRef.current = el.scrollTop;
+        return true;
+    }, []);
+
     useEffect(() => {
         const onFrameResize = (event: MessageEvent) => {
             const data = event.data as Record<string, unknown> | null;
             if (!data || data.type !== "resize") return;
             if (data.source !== "mix-rich-frame" && data.source !== "mix-ticket-frame") return;
-            requestAnimationFrame(() => requestAnimationFrame(applyStick));
+            requestAnimationFrame(() => requestAnimationFrame(() => { if (!restoreLoadMoreAnchor()) applyStick(); }));
         };
         window.addEventListener("message", onFrameResize);
         return () => window.removeEventListener("message", onFrameResize);
-    }, [applyStick]);
+    }, [applyStick, restoreLoadMoreAnchor]);
+
+    /** 展开更早的一批：先记下最上面那条在屏幕上的位置，展开后钉回去；同时撒手，不再跟底 */
+    const loadMoreTurns = useCallback(() => {
+        const el = scrollRef.current;
+        const first = el?.querySelector<HTMLElement>("[data-turn-id]");
+        if (el && first) {
+            loadMoreAnchorRef.current = {
+                turnId: first.dataset.turnId ?? "",
+                top: first.getBoundingClientRect().top - el.getBoundingClientRect().top,
+                until: Date.now() + 2500,
+            };
+        }
+        stickRef.current = "free";
+        setHiddenTurnCount((count) => Math.max(0, count - MIX_LOAD_MORE_TURNS));
+    }, []);
+    useLayoutEffect(() => { restoreLoadMoreAnchor(); }, [hiddenTurnCount, restoreLoadMoreAnchor]);
+
+    /**
+     * 轮数变了跟着修正收起数：
+     * · 变少（回溯/撤回）：只保证还露着几条，不多露——不然顶上冒出旧轮次把画面推下去；
+     * · 变多（新一轮到了）且正贴着底：把顶上多出来的收掉，常驻的 iframe 数量不随长局增长。
+     */
+    const turnCount = session?.turns.length ?? 0;
+    useLayoutEffect(() => {
+        setHiddenTurnCount((hidden) => {
+            const maxHidden = Math.max(0, turnCount - MIX_MIN_VISIBLE_TURNS);
+            if (hidden > maxHidden) return maxHidden;
+            if (stickRef.current === "bottom") return Math.max(hidden, turnCount - MIX_INITIAL_TURNS);
+            return hidden;
+        });
+    }, [turnCount]);
 
     /**
      * 用户自己翻页了就撒手，别在画布撑高时把他拽回去。
@@ -592,6 +675,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         say: (text) => { const t = text.trim().slice(0, 2000); if (t) handlePanelSay(t); },
         toast: (text) => { const t = text.trim().slice(0, 120); if (t) onToast(t); },
         mark: (materialId, id, state) => handlePanelMark(materialId, id, state),
+        dialogueButton: (materialId, button) => handleDialogueButton(materialId, button),
         call: async (materialId, name, params) => {
             const material = getMixMaterial(materialId);
             const declared = material?.kind === "mechanism" ? material.connectors ?? [] : [];
@@ -618,7 +702,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         stop: () => stopMixAudio(),
         charName: () => getMixSession(sessionId)?.charName ?? "",
         userName: () => getMixSession(sessionId)?.userName || MIX_DEFAULT_USER_NAME,
-    }), [sessionId, handlePanelStore, handlePanelState, handlePanelSay, handlePanelMark, onToast]);
+    }), [sessionId, handlePanelStore, handlePanelState, handlePanelSay, handlePanelMark, onToast, handleDialogueButton]);
 
     // 进对局建实例（材料改过会重建），离开时收掉
     useEffect(() => {
@@ -1033,6 +1117,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                         />
                     ))}
@@ -1067,11 +1152,18 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                         />
                     </div>
                 ))}
-                {session.turns.map((turn, idx) => {
+                {hiddenTurnCount > 0 ? (
+                    <button type="button" className="mix-load-more" onClick={loadMoreTurns}>
+                        查看更早的 {Math.min(MIX_LOAD_MORE_TURNS, hiddenTurnCount)} 条 · 还有 {hiddenTurnCount} 条
+                    </button>
+                ) : null}
+                {session.turns.slice(hiddenTurnCount).map((turn, offset) => {
+                    const idx = hiddenTurnCount + offset;
                     const isLast = idx === session.turns.length - 1;
                     const actions = (
                         <TurnActions
@@ -1085,12 +1177,12 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         />
                     );
                     return turn.role === "user" ? (
-                        <div className="mix-user-turn" data-with-actions="true" key={turn.id}>
+                        <div className="mix-user-turn" data-with-actions="true" data-turn-id={turn.id} key={turn.id}>
                             <div className="mix-user-bubble">{turn.text}</div>
                             {actions}
                         </div>
                     ) : (
-                        <div className="mix-assistant-turn" key={turn.id} data-turn={turn.id}>
+                        <div className="mix-assistant-turn" key={turn.id} data-turn={turn.id} data-turn-id={turn.id}>
                             <AssistantTurn turn={turn} ticketFrames={turnTicketFrames(turn)} encoreFrames={turnEncoreFrames(turn)} filterRules={assets.filterRules} state={turn.state} dialogue={dialogueFor(turn.id)} />
                             {/* 信任模式机括的坑位：prose 拿这一轮的正文容器本身，turn 在正文下方给一块 */}
                             {trustedBase ? trustedMechanisms.map((material) => {
@@ -1138,6 +1230,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                         />
                     </div>
@@ -1164,6 +1257,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                         />
                     ))}
@@ -1192,6 +1286,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                             onBox={handlePanelBox}
                         />
@@ -1214,6 +1309,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             onSay={handlePanelSay}
                             connectors={material.connectors}
                             onMark={handlePanelMark}
+                            onDialogueButton={handleDialogueButton}
                             onToast={onToast}
                         />
                     ))}
